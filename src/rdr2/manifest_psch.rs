@@ -1,5 +1,5 @@
 //! PSCH (PSO structure schema) section of a working RedM interior manifest
-//! (omm_lafitte _manifest.ymf, 620 bytes): the schema of CPackFileMetaData,
+//! (the _manifest.ymf of a working RedM map resource, 620 bytes): the schema of CPackFileMetaData,
 //! CImapDependencies, u32[], CItypDependencies and CInteriorBoundsFiles.
 //! Format data copied verbatim (schema sections cannot be derived).
 

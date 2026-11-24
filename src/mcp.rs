@@ -17,6 +17,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ("sixng", "sixng", "SixNG commands: placements, vehicles, GLB export, ttpf, names, interiors, movies, ... Pass [\"--help\"] (or [\"<command>\", \"--help\"]) for the list."),
     ("bcpack_calibrate", "bcpack-calibrate", "Fit the BCPack BC7/BC6H preset tables to the install's TTPF stores and write the calibrated table file the decoders load (else they use the shipped v1 tables): args [\"--game\", \"<6m dir>\"], optional [\"--out\", \"<file>\"]. Long run."),
     ("colour_textures", "colour-textures", "Export every GTA VI colour texture (albedo, detail, emissive; no normal, height or data maps) as top-mip PNGs: args [\"--game\", \"<6m dir>\", \"--out\", \"<dir>\"]. Long run."),
+    ("redm", "redm", "RDR2 / RedM output (RSC8): [\"convert\", \"ytd\", \"<dds-dir>\", \"<out.ytd>\"], [\"convert\", \"ydr\", \"<in.obj>\", \"<out.ydr>\"], [\"prop\", \"<6m name>\", \"--game\", \"<dir>\", \"--out\", \"<resource>\", \"--work\", \"<dir>\"] (one GTA VI prop -> RedM resource; --tint-row <n> --as <model> for a colour variant), [\"prop\", \"<6m name>\", \"--tints\", \"--game\", \"<dir>\"] (list tint rows), [\"prop\", \"--list\", \"<pattern>\"], [\"check\", \"<file>\"]. Pass [] for usage."),
     ("fivem", "fivem", "Build a ready FiveM resource from GTA VI: args like [\"build\", \"--game\", \"<dir>\", \"--out\", \"<res>\", \"--bbox\", \"x0,y0,x1,y1\"]. Pass [\"--help\"] for options."),
 ];
 

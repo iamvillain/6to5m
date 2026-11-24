@@ -5,6 +5,9 @@
 use super::geom::{aabb, push_geoms, push_geoms_n, V3};
 #[path = "interiors.rs"]
 mod interiors;
+pub(crate) use interiors::{interior_list, interior_name, resolvable as interior_resolvable, source as interior_source, InteriorSource};
+#[cfg(test)]
+pub(crate) use interiors::interior_hash;
 #[path = "lodlights.rs"]
 mod lodlights;
 #[path = "texopt.rs"]
@@ -387,6 +390,11 @@ struct Pools {
 }
 
 impl Pools {
+    /// Pools over <game>/data/ttdb (+ TTPF stores) with records in `store`.
+    fn new(game: &Path, store: super::texmem::Store) -> Pools {
+        let ttdb = game.join("data").join("ttdb");
+        Pools { game: game.to_path_buf(), catalog: crate::texture::Catalog::build(&ttdb).map_err(|e| eprintln!("{}: {e}", ttdb.display())).ok(), maps: Mutex::new(HashMap::new()), dir: PathBuf::from("texmem"), store }
+    }
     fn path(&self, hash: u32) -> PathBuf {
         self.dir.join(format!("{hash:08x}.dds"))
     }
@@ -414,6 +422,7 @@ impl Pools {
             Src::Tint { base, rgb } => self.tint_dds(base, *rgb)?,
             Src::FlatBump => rgba_dds(&[128u8, 128, 255, 255].repeat(16 * 16), 16, 16),
             Src::FlatSpec => flat_spec_dds(),
+            Src::Ma { hash, key, h64 } => self.ma_dds(*hash, *key, *h64)?,
             Src::Mem => return Err(format!("{}: memory-only texture gone", p.display())),
         };
         let b = Arc::new(b);
@@ -497,6 +506,31 @@ impl Pools {
         }
         self.flat_spec()?;
         Ok(name)
+    }
+
+    /// RDR2 `_ma` `r6m_<id>_ma` from the 6m speculartex (`redm prop` only;
+    /// `rdr2::ytd::ma_from_spec`). Missing, undecodable (flat BCPack) or
+    /// 8 px and smaller sources are errors: the caller binds blank_ma.
+    fn get_ma(&self, hash: u32, key: u64, h64: u64) -> Result<String, String> {
+        let id = self.slot("_ma", hash, key, h64);
+        let p = self.dir.join(format!("{id:08x}_ma.dds"));
+        if !self.store.exists(&p) {
+            let dds = self.ma_dds(hash, key, h64)?;
+            ytd::from_dds("check", &dds)?;
+            self.store.put(&p, dds, super::texmem::Src::Ma { hash, key, h64 });
+        }
+        Ok(format!("r6m_{id:08x}_ma"))
+    }
+
+    fn ma_dds(&self, hash: u32, key: u64, h64: u64) -> Result<Vec<u8>, String> {
+        let (w, h, rgba) = self.raw_rgba(hash, key, h64)?;
+        if w.max(h) <= 8 {
+            return Err(format!("speculartex {w}x{h}: engine default size"));
+        }
+        if bad_colour(&rgba) == Some("flat decode (undecoded BCPack data)") {
+            return Err("flat speculartex decode".into());
+        }
+        Ok(rgba_dds(&crate::rdr2::ytd::ma_from_spec(&rgba), w, h))
     }
 
     /// Makes sure the shared flat spec map exists.
@@ -644,12 +678,50 @@ fn split_tint(n: &str) -> (&str, usize) {
 
 /// Shader slot of the per-model tint palette (one-row embedded texture).
 const TINT_PALETTE: u32 = 0x2c8d_7182;
+/// 6m `speculartex` (R metal mask, G roughness, B AO: RDR2 `_ma` layout).
+const SPEC_SLOT: u32 = 0xc6f4_6e79;
 /// Colour of unused tint-palette entries: every 6m palette row ends in a
 /// run of (255, 187, 255) after its last real colour (ap_04_hub_glass
 /// 92..127, ss_rail_metror 80..127, ap_road_upper_a_decal 255 and rows 1-3,
 /// prop_am_loader_baggage 4..7). Vertex blue pointing there means untinted;
 /// baking it made glass, walls and decals magenta/navy.
 const PALETTE_FILL: [u8; 3] = [255, 187, 255];
+/// Entries per tint-palette row: multi-row palettes are rows of 256
+/// (prop_am_bench_int_01a: 2051 = 8 x 256 + 3, columns 0 and 10 line up in
+/// every row); a palette shorter than that is one short row.
+pub const PALETTE_ROW: usize = 256;
+
+/// Number of whole rows in a palette of `len` entries (a short palette is one row).
+pub fn palette_rows(len: usize) -> usize {
+    if len == 0 { 0 } else { (len / PALETTE_ROW).max(1) }
+}
+
+/// Palette index of (`row`, `column`).
+pub fn palette_index(row: usize, col: usize) -> usize {
+    row * PALETTE_ROW + col
+}
+
+/// Which palette row `rpf9_mesh` bakes, and whether tint colours keep their
+/// exact palette value or are rounded to 32 steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TintPick {
+    pub row: usize,
+    pub exact: bool,
+}
+
+impl TintPick {
+    /// `fivem build`: row 0, colours rounded to 32 steps (fewer tinted
+    /// texture copies across a whole map).
+    pub const BUILD: TintPick = TintPick { row: 0, exact: false };
+}
+
+/// Colour baked for palette entry `p` (None, filler or out of range: white).
+fn tint_colour(p: Option<&[u8; 4]>, exact: bool) -> [u8; 3] {
+    p.filter(|p| [p[0], p[1], p[2]] != PALETTE_FILL).map_or([255; 3], |p| {
+        let c = [p[0], p[1], p[2]];
+        if exact { c } else { c.map(|v| ((v as u32 + 16) / 32 * 32).min(255) as u8) }
+    })
+}
 
 /// Copy of colour texture `tex` multiplied by `c` (sRGB), or a solid `c`
 /// when the model has no usable colour texture (the palette then gives the
@@ -675,6 +747,21 @@ fn sixng_palette(ctx: &Ctx, e: &Entry) -> Option<Vec<[u8; 4]>> {
     let h64 = drawable::find_shaders(&r).into_iter().flat_map(|s| s.textures).find(|t| u32::from_str_radix(&t.param_hash, 16).ok() == Some(TINT_PALETTE) && u64::from_str_radix(&t.hash64, 16).is_ok_and(|h| emb.contains_key(&h)))?.hash64;
     let rgba = texture::embedded_rgba(&r, emb.get(&u64::from_str_radix(&h64, 16).ok()?)?).ok()?;
     Some(rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect())
+}
+
+/// Tint palette bound by submesh `sm`'s shader: the model's own one-row
+/// texture by name hash, else the sixng-core read (cached in `ext`).
+fn shader_palette(ctx: &Ctx, m: &crate::model::Drawable, sm: &crate::model::Mesh, entry: Option<&Entry>, ext: &std::cell::OnceCell<Option<Vec<[u8; 4]>>>) -> Option<Vec<[u8; 4]>> {
+    let t = sm.shader.and_then(|s| m.materials.as_ref()?.get(s)).and_then(|mat| mat.textures.iter().find(|t| t.param == TINT_PALETTE))?;
+    m.palettes.iter().find(|p| p.0 == t.hash).map(|p| p.1.clone()).or_else(|| ext.get_or_init(|| entry.and_then(|e| sixng_palette(ctx, e))).clone())
+}
+
+/// The model of a decoded resource that `name` converts: the one named so,
+/// else the one with the most vertices.
+fn pick_model<'a>(models: &'a [crate::model::Drawable], name: &str) -> Option<&'a crate::model::Drawable> {
+    let base = |n: &str| n.split(".#").next().unwrap_or(n).to_lowercase();
+    let want = name.to_lowercase();
+    models.iter().find(|m| base(&m.name) == want).or_else(|| models.iter().max_by_key(|m| m.meshes.iter().map(|m| m.positions.len()).sum::<usize>()))
 }
 
 fn placeholder() -> Tex {
@@ -1491,14 +1578,15 @@ fn keep_variant(sm: &crate::model::Mesh, set: &[u32], kept: u32) -> crate::model
 /// rpf9 decoder path; None when the model does not decode (or is skinned).
 /// Also returns the model's lower LOD levels (Med/Low/VLow, empty when
 /// absent) and its LodGroup distances.
-fn rpf9_mesh(ctx: &Ctx, pools: &Pools, name: &str, row: usize, an: &str, off: usize, entry: Option<&Entry>) -> Result<Option<(Built, Vec<Mesh>, [f32; 4])>, String> {
+/// `row` picks decal variants; `tint` the palette row and colour rounding;
+/// `ma` adds RDR2 `_ma` maps from the speculartex (`Geom::spec`, `redm prop`).
+fn rpf9_mesh(ctx: &Ctx, pools: &Pools, name: &str, row: usize, tint: TintPick, ma: bool, an: &str, off: usize, entry: Option<&Entry>) -> Result<Option<(Built, Vec<Mesh>, [f32; 4])>, String> {
     let ext_palettes = std::cell::OnceCell::new();
+    // first speculartex fallback reported (one line, not one per LOD)
+    let ma_err = std::cell::Cell::new(false);
     let an = an.to_string();
     let models = { let (m, o) = ctx.src_map(off); crate::model::load_models(m, o) };
-    let base = |n: &str| n.split(".#").next().unwrap_or(n).to_lowercase();
-    let want = name.to_lowercase();
-    let pick = models.iter().position(|m| base(&m.name) == want).or_else(|| (0..models.len()).max_by_key(|&i| models[i].meshes.iter().map(|m| m.positions.len()).sum::<usize>()));
-    let Some(m) = pick.map(|i| &models[i]) else {
+    let Some(m) = pick_model(&models, name) else {
         return Ok(None);
     };
     if m.bones && !m.fragment {
@@ -1608,23 +1696,34 @@ fn rpf9_mesh(ctx: &Ctx, pools: &Pools, name: &str, row: usize, an: &str, off: us
                 }
             }
         }
+        // RDR2 `_ma` of this material (opaque geometries with a normal map
+        // become `standard`); None binds the vanilla blank
+        let spec = if ma && kind == 0 && nrm.is_some() {
+            sm.shader.and_then(|s| m.materials.as_ref()?.get(s)).and_then(|mat| mat.textures.iter().find(|t| t.param == SPEC_SLOT)).and_then(|t| {
+                pools.get_ma(t.hash, key_of(t), t.h64).map_err(|e| if !ma_err.replace(true) { eprintln!("redm: {name}: speculartex {:016x}: {e} (blank_ma)", t.h64) }).ok()
+            })
+        } else {
+            None
+        };
+        if let Some(s) = spec.as_ref().filter(|s| !texs.contains(s)) {
+            texs.push(s.clone());
+        }
         let g0 = mesh.geoms.len();
         // Tint palette: bake palette entry (placement row, column = vertex colour
         // blue) into tinted copies of the colour texture, one per colour.
-        let palette = sm.shader.and_then(|s| m.materials.as_ref()?.get(s)).and_then(|mat| mat.textures.iter().find(|t| t.param == TINT_PALETTE)).and_then(|t| {
-            m.palettes.iter().find(|p| p.0 == t.hash).map(|p| p.1.clone()).or_else(|| ext_palettes.get_or_init(|| entry.and_then(|e| sixng_palette(ctx, e))).clone())
-        });
+        let palette = shader_palette(ctx, m, sm, entry, &ext_palettes);
         if let (Some(pal), Some(cols)) = (palette.as_ref(), sm.colors.as_deref()) {
             let mut groups: Vec<([u8; 3], Vec<u32>)> = Vec::new();
-            // Row 0. Reading tintValue as the row renders wrong (rocks near
-            // black, later rows mostly ffbbff filler: GTA6-Asset-Info
-            // 12-materials.md "Render check"), so the row lookup is not
-            // understood; row 0 is the default scheme. Only shaders that bind
-            // the palette themselves get here: LOD drawables without one carry
-            // a COLOR0.b that is no palette index.
-            let base = 0usize;
+            // `fivem build`: row 0. Reading tintValue as the row renders wrong
+            // (rocks near black, later rows mostly ffbbff filler:
+            // GTA6-Asset-Info 12-materials.md "Render check"), so the row
+            // lookup is not understood; row 0 is the default scheme. `redm
+            // prop --tint-row` picks another row by hand. Only shaders that
+            // bind the palette themselves get here: LOD drawables without one
+            // carry a COLOR0.b that is no palette index.
+            let base = palette_index(tint.row, 0);
             for t in sm.indices.chunks_exact(3) {
-                let c = cols.get(t[0] as usize).and_then(|c| pal.get(base + (c >> 16 & 255) as usize)).filter(|p| [p[0], p[1], p[2]] != PALETTE_FILL).map_or([255; 3], |p| [p[0], p[1], p[2]].map(|v| ((v as u32 + 16) / 32 * 32).min(255) as u8));
+                let c = tint_colour(cols.get(t[0] as usize).and_then(|c| pal.get(base + (c >> 16 & 255) as usize)), tint.exact);
                 match groups.iter_mut().find(|g| g.0 == c) {
                     Some(g) => g.1.extend_from_slice(t),
                     None => groups.push((c, t.to_vec())),
@@ -1632,7 +1731,7 @@ fn rpf9_mesh(ctx: &Ctx, pools: &Pools, name: &str, row: usize, an: &str, off: us
             }
             let fill = sm.indices.chunks_exact(3).filter(|t| cols.get(t[0] as usize).and_then(|c| pal.get(base + (c >> 16 & 255) as usize)).is_some_and(|p| [p[0], p[1], p[2]] == PALETTE_FILL)).count();
             if fill > 0 {
-                super::quality::hit("palette_fill", fill as u64, || format!("{name}: {fill} of {} triangles (row 0)", sm.indices.len() / 3));
+                super::quality::hit("palette_fill", fill as u64, || format!("{name}: {fill} of {} triangles (row {})", sm.indices.len() / 3, tint.row));
             }
             for (c, idx) in groups {
                 let t = if c == [255; 3] { tex.clone() } else { tinted(pools, &tex, c).unwrap_or_else(|_| tex.clone()) };
@@ -1644,11 +1743,17 @@ fn rpf9_mesh(ctx: &Ctx, pools: &Pools, name: &str, row: usize, an: &str, off: us
             if let Some(n) = &nrm {
                 mesh.geoms[g0..].iter_mut().for_each(|g| g.normal = n.clone());
             }
+            if let Some(s) = &spec {
+                mesh.geoms[g0..].iter_mut().for_each(|g| g.spec = s.clone());
+            }
             continue;
         }
         push_geoms_n(&mut mesh.geoms, &sm.positions, &sm.indices, sm.normals.as_deref(), sm.uvs.as_deref(), sm.colors.as_deref(), &tex, kind);
         if let Some(n) = nrm {
             mesh.geoms[g0..].iter_mut().for_each(|g| g.normal = n.clone());
+        }
+        if let Some(s) = spec {
+            mesh.geoms[g0..].iter_mut().for_each(|g| g.spec = s.clone());
         }
     }
     }
@@ -1777,7 +1882,7 @@ fn convert(ctx: &Ctx, pools: &Pools, name: &str, off: usize, entry: Option<&Entr
         Some(d) => (d.model.as_str(), 0),
         None => split_tint(name),
     };
-    let rpf = rpf9_mesh(ctx, pools, base, row, &an, off, entry)?;
+    let rpf = rpf9_mesh(ctx, pools, base, row, TintPick::BUILD, false, &an, off, entry)?;
     let mut lower: Vec<Mesh> = Vec::new();
     let mut lod_dist = [9998.0f32; 4];
     let (mesh, texs, missing, frag_out) = match (rpf, entry) {
@@ -1857,6 +1962,191 @@ fn convert(ctx: &Ctx, pools: &Pools, name: &str, off: usize, entry: Option<&Entr
     Ok(Some(from_info(&info)))
 }
 
+/// One 6m model converted to the in-memory writer inputs, outside a build.
+pub struct PropSource {
+    /// LOD levels (High first; Med/Low/VLow may be empty), named `r6m_<name>`.
+    pub levels: Vec<Mesh>,
+    pub lod_dist: [f32; 4],
+    /// (texture name, DDS bytes) of every texture the levels reference.
+    pub textures: Vec<(String, Arc<Vec<u8>>)>,
+    /// textures that did not resolve (the geometry names `r6m_missing`)
+    pub missing: Vec<String>,
+    /// the sixng index entry kind: "dr" drawable or "ft" fragment
+    pub rtype: String,
+    /// skinned drawable (bones, not a fragment): the rpf9 path skips it and
+    /// the levels come from sixng-core's decoder in bind pose
+    pub skinned: bool,
+}
+
+/// Several props converted with one levels index, archive map and texture
+/// pool (texture names stay consistent between the props: one texture,
+/// one `r6m_<slot>` name).
+pub struct PropBatch {
+    ctx: Ctx,
+    index: ArchiveIndex,
+    pools: Pools,
+}
+
+impl PropBatch {
+    /// levels.rpf plus the pack archives (PACK_ARCHIVES) that are indexed.
+    pub fn open(game: &Path, work: &Path) -> Result<PropBatch, String> {
+        let (index, _) = levels_index(work)?;
+        let mut ctx = super::single_ctx(game, work)?;
+        ctx.packs = super::open_packs(game, work, "its models are not converted");
+        Ok(PropBatch { ctx, index, pools: Pools::new(game, super::texmem::Store::temp()) })
+    }
+
+    /// Archive ids whose models `source_model` can load.
+    pub fn archives(&self) -> Vec<String> {
+        std::iter::once("levels.rpf".to_string()).chain(self.ctx.packs.iter().map(|p| p.id.clone())).collect()
+    }
+
+    /// The model a placement names by sixng model id ("<archive>@<hex>"
+    /// or "<archive>@<hex>#<member>", as `fivem build` resolves placements:
+    /// `Ctx::voff_of`, then the index entry at that offset). `name` picks
+    /// the member / model inside the resource (`pick_model`; the largest
+    /// model when none has that name) and names the levels (`r6m_<name>`).
+    pub fn source_model(&self, name: &str, model_id: &str, tint: TintPick) -> Result<PropSource, String> {
+        let off = self.ctx.voff_of(model_id).ok_or_else(|| format!("{model_id}: archive not loaded (index it with `sixng index <archive>`)"))?;
+        let (index, raw) = match off >> super::PACK_SHIFT {
+            0 => (&self.index, off),
+            s => (&self.ctx.packs[s - 1].index, off & ((1usize << super::PACK_SHIFT) - 1)),
+        };
+        let e = index.entries.iter().find(|e| e.off as usize == raw).ok_or_else(|| format!("{model_id}: no index entry at that offset"))?;
+        source_of(&self.ctx, &self.pools, e, off, name, tint)
+    }
+}
+
+/// Decode the levels.rpf drawable (or fragment main drawable, bind pose)
+/// `name` from the sixng index in `<work>/index/levels.json`, with the same
+/// mesh and texture path as `fivem build` (rpf9 decoder first, sixng-core
+/// for fragments it does not take; colour, tint and normal maps).
+/// `tint`: palette row (checked against `prop_tints`) and colour rounding;
+/// decal variants stay on row 0.
+pub fn prop_source(game: &Path, work: &Path, name: &str, tint: TintPick) -> Result<PropSource, String> {
+    let (ctx, e) = prop_entry(game, work, name)?;
+    let pools = Pools::new(game, super::texmem::Store::temp());
+    source_of(&ctx, &pools, &e, e.off as usize, name, tint)
+}
+
+/// `off`: virtual offset of `e` (`Ctx::src_map`; = e.off in levels.rpf).
+fn source_of(ctx: &Ctx, pools: &Pools, e: &Entry, off: usize, name: &str, tint: TintPick) -> Result<PropSource, String> {
+    let want = name.to_ascii_lowercase();
+    if tint.row > 0 {
+        check_tint_row(name, &prop_tints_of(ctx, e, off, &want)?, tint.row)?;
+    }
+    let an = safe_name(name);
+    let mut skinned = false;
+    let (mut mesh, texs, missing, mut lower, lod_dist) = match rpf9_mesh(ctx, pools, &want, 0, tint, true, &an, off, Some(e))? {
+        Some(((m, t, x, _), lw, ld)) => (m, t, x, lw, ld),
+        None => {
+            let models = { let (m, o) = ctx.src_map(off); crate::model::load_models(m, o) };
+            skinned = pick_model(&models, &want).is_some_and(|m| m.bones && !m.fragment);
+            let (m, t, x, _) = sixng_mesh(ctx, pools, &an, e)?;
+            (m, t, x, Vec::new(), [9998.0; 4])
+        }
+    };
+    promote_base_layer(&mut mesh);
+    lower.iter_mut().for_each(promote_base_layer);
+    if mesh.geoms.is_empty() {
+        return Err(format!("{name}: no triangles"));
+    }
+    let mut textures = Vec::new();
+    for t in texs.iter().filter(|t| t.as_str() != MISSING) {
+        let b = pools.load(&pools.dir.join(format!("{}.dds", &t[4..])))?;
+        textures.push((t.clone(), b));
+    }
+    let mut levels = vec![mesh];
+    levels.extend(lower);
+    Ok(PropSource { levels, lod_dist, textures, missing, rtype: e.rtype.clone().unwrap_or_default(), skinned })
+}
+
+/// The levels.rpf sixng index (<work>/index/levels.json) and its path.
+fn levels_index(work: &Path) -> Result<(ArchiveIndex, PathBuf), String> {
+    let ip = work.join("index").join("levels.json");
+    let index = sixng_core::scan::load_index(&ip).map_err(|e| format!("{}: {e:#} (run `6ixpack sixng index levels --game .. --work ..` first)", ip.display()))?;
+    Ok((index, ip))
+}
+
+/// Index entry (drawable first, else fragment) of model `name`.
+fn find_prop<'a>(index: &'a ArchiveIndex, ip: &Path, name: &str) -> Result<&'a Entry, String> {
+    let of = |t: &str| index.entries.iter().find(|e| e.rtype.as_deref() == Some(t) && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)));
+    of("dr").or_else(|| of("ft")).ok_or_else(|| format!("{name}: no drawable or fragment of that name in {}", ip.display()))
+}
+
+/// levels.rpf index entry (drawable first, else fragment) of `name`, and a
+/// single-model context.
+fn prop_entry(game: &Path, work: &Path, name: &str) -> Result<(Ctx, Entry), String> {
+    let (index, ip) = levels_index(work)?;
+    let e = find_prop(&index, &ip, name)?.clone();
+    Ok((super::single_ctx(game, work)?, e))
+}
+
+/// One tint palette of a model and the palette columns (vertex colour
+/// blue) its LOD0 triangles use, as `rpf9_mesh` reads them.
+pub struct PaletteUse {
+    pub palette: Vec<[u8; 4]>,
+    pub columns: Vec<usize>,
+}
+
+impl PaletteUse {
+    pub fn rows(&self) -> usize {
+        palette_rows(self.palette.len())
+    }
+
+    /// Colour of `column` in `row`; None when filler, white or past the end (untinted).
+    pub fn colour(&self, row: usize, column: usize) -> Option<[u8; 3]> {
+        let c = tint_colour(self.palette.get(palette_index(row, column)), true);
+        (c != [255; 3]).then_some(c)
+    }
+}
+
+/// Error unless every palette of the model has row `row`.
+pub fn check_tint_row(name: &str, uses: &[PaletteUse], row: usize) -> Result<(), String> {
+    let Some(rows) = uses.iter().map(PaletteUse::rows).min() else {
+        return Err(format!("{name}: no tint palette embedded, only row 0 (untinted) exists"));
+    };
+    if row >= rows {
+        return Err(format!("{name}: tint row {row} out of range, valid rows 0..={} (palette of {} entries)", rows - 1, uses.iter().map(|u| u.palette.len()).max().unwrap_or(0)));
+    }
+    Ok(())
+}
+
+/// Tint palettes `redm prop <name>` would bake (empty: none embedded, or
+/// the model is not on the rpf9 decoder path, which alone bakes tints).
+pub fn prop_tints(game: &Path, work: &Path, name: &str) -> Result<Vec<PaletteUse>, String> {
+    let (ctx, e) = prop_entry(game, work, name)?;
+    prop_tints_of(&ctx, &e, e.off as usize, &name.to_ascii_lowercase())
+}
+
+fn prop_tints_of(ctx: &Ctx, e: &Entry, off: usize, name: &str) -> Result<Vec<PaletteUse>, String> {
+    let models = { let (m, o) = ctx.src_map(off); crate::model::load_models(m, o) };
+    let Some(m) = pick_model(&models, name).filter(|m| !m.bones || m.fragment) else {
+        return Ok(Vec::new());
+    };
+    let ext = std::cell::OnceCell::new();
+    let mut out: Vec<PaletteUse> = Vec::new();
+    for sm in &m.meshes {
+        let (Some(pal), Some(cols)) = (shader_palette(ctx, m, sm, Some(e), &ext), sm.colors.as_deref()) else { continue };
+        let at = match out.iter().position(|u| u.palette == pal) {
+            Some(i) => i,
+            None => {
+                out.push(PaletteUse { palette: pal, columns: Vec::new() });
+                out.len() - 1
+            }
+        };
+        for t in sm.indices.chunks_exact(3) {
+            if let Some(c) = cols.get(t[0] as usize).map(|c| (c >> 16 & 255) as usize) {
+                if !out[at].columns.contains(&c) {
+                    out[at].columns.push(c);
+                }
+            }
+        }
+    }
+    out.iter_mut().for_each(|u| u.columns.sort_unstable());
+    Ok(out)
+}
+
 pub fn build(ctx: &Ctx, index: &ArchiveIndex) -> Result<(), Box<dyn Error>> {
     let p = super::Phase::new(ctx, "  placements");
     let dir = placements_dir(ctx, index)?;
@@ -1897,10 +2187,9 @@ pub fn build(ctx: &Ctx, index: &ArchiveIndex) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     // source textures: decoded in memory (4 GB held), records in the index
-    let cache = PathBuf::from("texmem");
     let store = super::texmem::Store::open(ctx.o.work.join("index").join(format!("fivem_textures_v{}s2{}.json", sixng_core::bcpack::BCPACK_DECODER_VERSION, sixng_core::bcpack_presets::tag())), 4 << 30);
-    let ttdb = ctx.o.game.join("data").join("ttdb");
-    let pools = Pools { game: ctx.o.game.clone(), catalog: crate::texture::Catalog::build(&ttdb).map_err(|e| eprintln!("{}: {e}", ttdb.display())).ok(), maps: Mutex::new(HashMap::new()), dir: cache.clone(), store };
+    let pools = Pools::new(&ctx.o.game, store);
+    let cache = pools.dir.clone();
     let mut by_off: HashMap<usize, &Entry> = index.entries.iter().map(|e| (e.off as usize, e)).collect();
     for (s, pk) in ctx.packs.iter().enumerate() {
         by_off.extend(pk.index.entries.iter().map(|e| (e.off as usize | ((s + 1) << super::PACK_SHIFT), e)));

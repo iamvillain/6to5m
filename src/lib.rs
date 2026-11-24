@@ -16,3 +16,4 @@ pub mod scancache;
 pub mod texture;
 pub mod zlib;
 pub mod gta5;
+pub mod rdr2;

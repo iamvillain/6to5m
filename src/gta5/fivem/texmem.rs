@@ -32,6 +32,8 @@ pub enum Src {
     Tint { base: String, rgb: [u8; 3] },
     FlatBump,
     FlatSpec,
+    /// RDR2 `_ma` made from a 6m speculartex (`redm prop` only)
+    Ma { hash: u32, key: u64, h64: u64 },
     /// only in memory (vehicle / weapon runs, never persisted)
     Mem,
 }

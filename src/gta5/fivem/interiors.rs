@@ -68,11 +68,31 @@ pub struct Interior {
     col: Option<Entry>,
 }
 
-#[derive(Clone)]
-struct Portal {
-    from: u32,
-    to: u32,
-    corners: [V3; 4],
+#[derive(Clone, serde::Serialize)]
+pub struct Portal {
+    /// room indices (into the interior's rooms, limbo = 0)
+    pub from: u32,
+    pub to: u32,
+    /// interior space
+    pub corners: [V3; 4],
+    /// 6m portal flags (`67d26872`, GTA V CMloPortalDef flags; meaning not
+    /// checked for 6m). `emit` writes 0, as before.
+    pub flags: u32,
+}
+
+/// What one 6m interior archetype's meta object holds beyond the sixng
+/// placement JSON: portals and per-room bounds and flags.
+struct MloMeta {
+    /// Some when the archetype has a portal list and every portal decoded
+    portals: Option<Vec<Portal>>,
+    /// per room in file order (same order as the placement JSON's rooms)
+    rooms: Vec<RoomMeta>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RoomMeta {
+    bounds: Option<[V3; 2]>,
+    flags: Option<u32>,
 }
 
 /// Add another archive's interiors: an interior archetype already loaded
@@ -86,8 +106,15 @@ pub fn merge(into: &mut Vec<Interior>, more: Vec<Interior>) {
     }
 }
 
-/// Portals of every interior archetype in one 6m meta file, by name hash.
+/// Portals of every interior archetype in one 6m meta file, by name hash
+/// (archetypes whose portals do not all decode are left out).
 fn file_portals(levels: &Path, index: &ArchiveIndex, off: u64) -> HashMap<u32, Vec<Portal>> {
+    file_mlos(levels, index, off).into_iter().filter_map(|(h, m)| Some((h, m.portals?))).collect()
+}
+
+/// Portals and room bounds of every interior archetype in one 6m meta
+/// file (entry at `off`), by name hash.
+fn file_mlos(levels: &Path, index: &ArchiveIndex, off: u64) -> HashMap<u32, MloMeta> {
     let mut out = HashMap::new();
     let Some(e) = index.entries.iter().find(|e| e.off == off) else { return out };
     let Ok(r) = Resource::load_sys(levels, e) else { return out };
@@ -95,20 +122,84 @@ fn file_portals(levels: &Path, index: &ArchiveIndex, off: u64) -> HashMap<u32, V
     let get = |v: &Value, h: u32| v.get(meta7a::field_name(h)).or_else(|| v.get(format!("{h:08x}"))).cloned();
     for (mlo, o) in meta7a::mlos(&m).iter().zip(m.objects(meta7a::MLO_ARCHETYPE)) {
         let Some(v) = m.object(meta7a::MLO_ARCHETYPE, o, 4) else { continue };
-        let Some(list) = get(&v, 0x89f7_e992).and_then(|x| x.as_array().cloned()) else { continue };
-        let mut ps = Vec::new();
-        for p in &list {
-            let n = |h| get(p, h).and_then(|x| x.as_u64()).map(|x| x as u32);
-            let cs: Vec<V3> = get(p, 0x4f42_aeb3).and_then(|x| x.as_array().cloned()).unwrap_or_default().iter().map(f3).collect();
-            if let (Some(from), Some(to), Ok(corners)) = (n(0xf470_d2fd), n(0x9b64_9621), <[V3; 4]>::try_from(cs)) {
-                ps.push(Portal { from, to, corners });
+        // rooms (`cd20d7a8`): bbMin / bbMax / flags as GTA V CMloRoomDef
+        let rooms = get(&v, 0xcd20_d7a8)
+            .and_then(|x| x.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                let v3 = |h| get(r, h).and_then(|x| x.as_array().filter(|a| a.len() >= 3).map(|_| f3(&x)));
+                RoomMeta { bounds: v3(0xd9ef_8236).zip(v3(0xe78a_a618)).map(|(a, b)| [a, b]), flags: get(r, 0x67d2_6872).and_then(|x| x.as_u64()).map(|x| x as u32) }
+            })
+            .collect();
+        let portals = get(&v, 0x89f7_e992).and_then(|x| x.as_array().cloned()).and_then(|list| {
+            let mut ps = Vec::new();
+            for p in &list {
+                let n = |h| get(p, h).and_then(|x| x.as_u64()).map(|x| x as u32);
+                let cs: Vec<V3> = get(p, 0x4f42_aeb3).and_then(|x| x.as_array().cloned()).unwrap_or_default().iter().map(f3).collect();
+                if let (Some(from), Some(to), Ok(corners)) = (n(0xf470_d2fd), n(0x9b64_9621), <[V3; 4]>::try_from(cs)) {
+                    ps.push(Portal { from, to, corners, flags: n(0x67d2_6872).unwrap_or(0) });
+                }
             }
-        }
-        if ps.len() == list.len() {
-            out.insert(mlo.name, ps);
-        }
+            (ps.len() == list.len()).then_some(ps)
+        });
+        out.insert(mlo.name, MloMeta { portals, rooms });
     }
     out
+}
+
+/// An interior entity's fields as the sixng placement JSON stores them
+/// (shared by `load` and `source`).
+struct RawEnt<'a> {
+    name: Option<&'a str>,
+    model_id: Option<&'a str>,
+    pos: V3,
+    /// as stored in CEntityDef (inverse of the interior-space orientation)
+    rot: Q,
+    sxy: f32,
+    sz: f32,
+    lod: f32,
+    room: Option<u32>,
+    set: Option<u32>,
+}
+
+fn raw_ent(e: &Value) -> RawEnt<'_> {
+    RawEnt {
+        name: e["name"].as_str(),
+        model_id: e["model_id"].as_str(),
+        pos: f3(&e["position"]),
+        rot: q4(&e["rotation_world"]).map(|q| [-q[0], -q[1], -q[2], q[3]]).or_else(|| q4(&e["rotation"])).unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        sxy: e["scale_xy"].as_f64().unwrap_or(1.0) as f32,
+        sz: e["scale_z"].as_f64().unwrap_or(1.0) as f32,
+        lod: e["lod"]["lod_dist"].as_f64().unwrap_or(-1.0) as f32,
+        room: hx(&e["interior"]["room"]),
+        set: hx(&e["interior"]["entity_set"]),
+    }
+}
+
+/// Entity indices (into the interior file's entity list) of one interior
+/// instance line: its entities, then its entity-set entities.
+fn inst_entities(inst: &Value) -> impl Iterator<Item = usize> + '_ {
+    inst["entities"].as_array().into_iter().flatten().chain(inst["entity_set_entities"].as_array().into_iter().flatten()).filter_map(|v| v.as_u64()).map(|i| i as usize)
+}
+
+/// (name hash, name) of the rooms of interior `h` in its file's placement
+/// JSON, in file order; a lone limbo when it lists none.
+fn rooms_of(src: &Value, h: u32) -> Vec<(u32, Option<String>)> {
+    let info = src["interiors"].as_array().into_iter().flatten().find(|v| hx(&v["interior"]) == Some(h));
+    let mut rooms: Vec<(u32, Option<String>)> =
+        info.and_then(|v| v["rooms"].as_array()).into_iter().flatten().filter_map(|r| Some((hx(&r["room"])?, r["name"].as_str().map(str::to_string)))).collect();
+    if rooms.is_empty() {
+        rooms.push((crate::gta5::rsc::joaat("limbo"), Some("limbo".into())));
+    }
+    rooms
+}
+
+/// Collision bounds id used for an interior instance: an exact bbox match,
+/// else sixng's linked bounds when the link is high or medium confidence.
+fn collision_id(inst: &Value) -> Option<&str> {
+    let l = &inst["collision_linked"];
+    inst["collision"].as_array().and_then(|a| a.first()).and_then(Value::as_str).or_else(|| l["id"].as_str().filter(|_| matches!(l["confidence"].as_str(), Some("high" | "medium"))))
 }
 
 fn f3(v: &Value) -> V3 {
@@ -163,29 +254,24 @@ pub fn load(ctx: &Ctx, dir: &Path, index: &ArchiveIndex, archive_id: &str) -> Ve
             continue;
         };
         let ents = src["entities"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let info = src["interiors"].as_array().into_iter().flatten().find(|v| hx(&v["interior"]) == Some(h));
-        let mut rooms: Vec<(u32, Option<String>)> =
-            info.and_then(|v| v["rooms"].as_array()).into_iter().flatten().filter_map(|r| Some((hx(&r["room"])?, r["name"].as_str().map(str::to_string)))).collect();
-        if rooms.is_empty() {
-            rooms.push((crate::gta5::rsc::joaat("limbo"), Some("limbo".into())));
-        }
+        let rooms = rooms_of(&src, h);
         let mut children = Vec::new();
-        for ix in inst["entities"].as_array().into_iter().flatten().chain(inst["entity_set_entities"].as_array().into_iter().flatten()) {
-            let Some((ei, e)) = ix.as_u64().and_then(|i| Some((i as usize, ents.get(i as usize)?))) else { continue };
-            let (Some(name), Some(off)) = (e["name"].as_str(), e["model_id"].as_str().and_then(|m| ctx.voff_of(m))) else {
+        for ei in inst_entities(&inst) {
+            let Some(e) = ents.get(ei) else { continue };
+            let r = raw_ent(e);
+            let (Some(name), Some(off)) = (r.name, r.model_id.and_then(|m| ctx.voff_of(m))) else {
                 continue;
             };
-            let rot = q4(&e["rotation_world"]).map(|q| [-q[0], -q[1], -q[2], q[3]]).or_else(|| q4(&e["rotation"])).unwrap_or([0.0, 0.0, 0.0, 1.0]);
             children.push(Child {
                 name: name.to_string(),
                 off,
-                pos: f3(&e["position"]),
-                rot,
-                sxy: e["scale_xy"].as_f64().unwrap_or(1.0) as f32,
-                sz: e["scale_z"].as_f64().unwrap_or(1.0) as f32,
-                lod: e["lod"]["lod_dist"].as_f64().unwrap_or(-1.0) as f32,
-                room: hx(&e["interior"]["room"]).unwrap_or(0),
-                set: hx(&e["interior"]["entity_set"]),
+                pos: r.pos,
+                rot: r.rot,
+                sxy: r.sxy,
+                sz: r.sz,
+                lod: r.lod,
+                room: r.room.unwrap_or(0),
+                set: r.set,
                 lights: Vec::new(),
                 src: (file.to_string(), ei),
             });
@@ -197,9 +283,7 @@ pub fn load(ctx: &Ctx, dir: &Path, index: &ArchiveIndex, archive_id: &str) -> Ve
             let off = u64::from_str_radix(file, 16).unwrap_or(0);
             meta.entry(file.to_string()).or_insert_with(|| file_portals(&levels, index, off)).get(&h).cloned().filter(|p| p.iter().all(|p| (p.from as usize) < rooms.len() && (p.to as usize) < rooms.len()))
         };
-        let l = &inst["collision_linked"];
-        let col_id = inst["collision"].as_array().and_then(|a| a.first()).and_then(Value::as_str).or_else(|| l["id"].as_str().filter(|_| matches!(l["confidence"].as_str(), Some("high" | "medium"))));
-        let col = col_id.and_then(|id| by_id.get(id)).map(|e| (*e).clone());
+        let col = collision_id(&inst).and_then(|id| by_id.get(id)).map(|e| (*e).clone());
         by_hash.insert(h, Interior { hash: h, bbox, rooms, children, instances: vec![(ip, ri)], portals, col });
     }
     if missing > 0 {
@@ -828,4 +912,429 @@ fn light_ext(mb: &mut MB, lights: &[Value]) -> ((u64, u16), usize) {
     w.u32(0).u32(0).u32(0).u32(0).v3([0.0; 3]).f32(0.0);
     arr(&mut w, lp, n as u16);
     (mb.ptr_array(LIGHTEXT.name, vec![w.b]), n)
+}
+
+// ---------------------------------------------------------------------------
+// One interior as plain data, outside `fivem build` (`redm interior`). Reads
+// the same sixng outputs as `load` (<work>/placements/levels/interiors.jsonl
+// and the interior file's placement JSON) through the same helpers, plus the
+// meta object (portals, room bounds) and the linked bounds (collision).
+
+/// One 6m interior archetype: everything a converter needs, interior space.
+#[derive(serde::Serialize)]
+pub struct InteriorSource {
+    /// joaat of the 6m interior archetype name (the name itself is not recovered)
+    #[serde(serialize_with = "hex8")]
+    pub hash: u32,
+    /// `int_<hash>`: the name used for outputs
+    pub name: String,
+    /// sixng id of the interior archetype file (holds the interior's entities)
+    pub file: String,
+    /// archetype bbox, interior space
+    pub bbox: [V3; 2],
+    /// world placements (CMloInstanceDef)
+    pub placements: Vec<IntPlacement>,
+    /// rooms in file order (index 0 is limbo in the 6m files seen)
+    pub rooms: Vec<IntRoom>,
+    /// decoded portals; `portals_complete` false when some did not decode
+    /// (then `fivem build` keeps every entity in limbo)
+    pub portals: Vec<Portal>,
+    pub portals_complete: bool,
+    /// the interior's entities, then its entity-set entities (instance order)
+    pub entities: Vec<IntEntity>,
+    pub entity_sets: Vec<IntSet>,
+    /// linked collision in interior space; None when no bounds are linked
+    /// (or the linked bounds do not decode: see `collision_note`)
+    #[serde(skip)]
+    pub collision: Option<IntCollision>,
+    pub collision_note: Option<String>,
+}
+
+fn hex8<S: serde::Serializer>(h: &u32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{h:08x}"))
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct IntPlacement {
+    /// sixng id of the map file holding the CMloInstanceDef
+    pub map: String,
+    /// instance index in that file
+    pub instance: usize,
+    pub position: V3,
+    /// x, y, z, w as stored in CMloInstanceDef: the interior's world
+    /// orientation itself (not inverted, unlike entities; sixng meta7a,
+    /// checked there by fitting interior collision into its shell)
+    pub rotation: Q,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct IntRoom {
+    #[serde(serialize_with = "hex8")]
+    pub hash: u32,
+    pub name: Option<String>,
+    /// room bbMin / bbMax from the 6m meta object (interior space); None
+    /// when the room record has none
+    pub bounds: Option<[V3; 2]>,
+    pub flags: Option<u32>,
+    /// indices into `entities`
+    pub entities: Vec<usize>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct IntEntity {
+    /// index in the interior file's entity list
+    pub file_index: usize,
+    #[serde(serialize_with = "hex8")]
+    pub archetype: u32,
+    /// model name, when sixng resolved the archetype hash
+    pub name: Option<String>,
+    /// sixng model id ("<archive>@<offset>[#member]")
+    pub model_id: Option<String>,
+    /// interior space
+    pub position: V3,
+    /// x, y, z, w as stored in CEntityDef: the INVERSE of the entity's
+    /// interior-space orientation (GTA V convention; `fivem build` writes
+    /// it into MLO CEntityDefs as is and uses the conjugate for bounds)
+    pub rotation: Q,
+    pub scale_xy: f32,
+    pub scale_z: f32,
+    /// -1 = the archetype's own lodDist
+    pub lod_dist: f32,
+    pub flags: u32,
+    /// tint palette row (`3c852527`, 0 = default)
+    pub tint_row: u32,
+    /// index into `rooms`; None = not in a room of this interior
+    pub room: Option<usize>,
+    /// index into `entity_sets`
+    pub entity_set: Option<usize>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct IntSet {
+    #[serde(serialize_with = "hex8")]
+    pub hash: u32,
+    pub name: Option<String>,
+    /// indices into `entities`
+    pub entities: Vec<usize>,
+}
+
+/// Linked interior bounds, interior space (sixng bounds decode_native,
+/// weapon-only shapes skipped as `fivem build` does).
+pub struct IntCollision {
+    pub id: String,
+    /// "exact" (bbox match) or sixng's link method; with its confidence
+    pub method: String,
+    pub confidence: String,
+    pub vertices: Vec<V3>,
+    pub triangles: Vec<[u32; 3]>,
+    /// 6m surface id per triangle
+    pub materials: Vec<u16>,
+    /// boxes, spheres, capsules, cylinders as stored (each with its surface id)
+    pub primitives: Vec<sixng_core::bounds::NativePrim>,
+    /// every shape as triangles (primitives tessellated by sixng-core's
+    /// bounds decoder): movement shapes (weapon-only children skipped, as
+    /// `fivem build`), and all shapes including weapon-only ones
+    pub mover: Tris,
+    pub all: Tris,
+    /// 8-byte 6m material record per surface id
+    pub material_records: BTreeMap<u16, [u8; 8]>,
+    pub bbox: [V3; 2],
+}
+
+/// Interior archetype hash from `int_<hash>`, a bare 8-digit hex hash, or
+/// a name (its joaat).
+pub fn interior_hash(s: &str) -> Option<u32> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    let h = t.strip_prefix("int_").unwrap_or(&t);
+    if h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return u32::from_str_radix(h, 16).ok();
+    }
+    Some(crate::gta5::rsc::joaat(&t))
+}
+
+/// Output name of an interior archetype.
+pub fn interior_name(h: u32) -> String {
+    format!("int_{h:08x}")
+}
+
+fn placement_dir(work: &Path) -> std::path::PathBuf {
+    work.join("placements").join("levels")
+}
+
+/// The sixng interior instances (<work>/placements/levels/interiors.jsonl),
+/// or an error naming the passes that make it.
+fn instance_lines(work: &Path) -> Result<Vec<Value>, String> {
+    let w = work.display();
+    let p = placement_dir(work).join("interiors.jsonl");
+    let col = work.join("collision").join("levels").join("index.jsonl");
+    let text = fs::read_to_string(&p).map_err(|e| {
+        format!("{}: {e}\n  missing pass `sixng interiors`: run `6ixpack sixng --game <dir> --work {w} collision levels --out {w}` (bounds index for the collision link), then `6ixpack sixng --game <dir> --work {w} interiors levels --out {w}`", p.display())
+    })?;
+    if !col.is_file() {
+        return Err(format!("{}: missing pass `sixng collision`: interiors.jsonl was made without it, so no interior has linked collision. Run `6ixpack sixng --game <dir> --work {w} collision levels --out {w}`, then `sixng interiors` again", col.display()));
+    }
+    Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+/// Placement JSON of an interior file (`levels.rpf@<off>`), or an error
+/// naming the `sixng placements` run that writes it.
+fn interior_file(work: &Path, file: &str) -> Result<Value, String> {
+    let off = file.strip_prefix("levels.rpf@").ok_or_else(|| format!("{file}: interior file outside levels.rpf (only levels.rpf is read)"))?;
+    let p = placement_dir(work).join(format!("{off}.json"));
+    let b = fs::read(&p).map_err(|e| {
+        let w = work.display();
+        format!("{}: {e}\n  missing pass `sixng placements` for this file: run `6ixpack sixng --game <dir> --work {w} placements levels --id {file} --out {w}` (or --id-file with every interior_file of interiors.jsonl)", p.display())
+    })?;
+    serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// One line of `redm interior --list`.
+pub struct IntSummary {
+    pub hash: u32,
+    pub placements: Vec<V3>,
+    pub rooms: usize,
+    /// None when not decoded (no game dir given, or the meta did not parse)
+    pub portals: Option<(usize, bool)>,
+    pub entities: usize,
+    pub set_entities: usize,
+    /// entities (incl. entity-set entities) whose model can be loaded
+    pub entities_resolvable: usize,
+    /// distinct entity archetypes, and how many of them have a model id in
+    /// an indexed archive (`resolvable`)
+    pub archetypes: usize,
+    pub resolvable: usize,
+    /// collision bounds id and how it was linked ("exact", or sixng's method
+    /// and confidence; "... (not used)" for a low-confidence link); None =
+    /// no link at all
+    pub collision: Option<(String, String)>,
+    /// why the interior's entity data is missing (empty interior file, ...)
+    pub problem: Option<String>,
+}
+
+fn link_of(inst: &Value) -> Option<(String, String)> {
+    let id = collision_id(inst)?;
+    let exact = inst["collision"].as_array().and_then(|a| a.first()).and_then(Value::as_str) == Some(id);
+    let l = &inst["collision_linked"];
+    Some((id.to_string(), if exact { "exact".into() } else { format!("{} {}", l["method"].as_str().unwrap_or("?"), l["confidence"].as_str().unwrap_or("?")) }))
+}
+
+/// levels.rpf and the pack archives (PACK_ARCHIVES) indexed in `work`.
+pub fn indexed_archives(work: &Path) -> Vec<String> {
+    let ix = work.join("index");
+    std::iter::once("levels.rpf".to_string()).chain(super::super::PACK_ARCHIVES.iter().filter(|id| sixng_core::scan::index_path(&ix, id).is_file()).map(|id| id.to_string())).collect()
+}
+
+/// The sixng model id of a placement entity when its model is in one of
+/// `archives` (Err: why not). This is `fivem build`'s route: sixng puts a
+/// model id on every placement whose archetype hash is the joaat of an
+/// indexed drawable / fragment / drawable-dictionary member name, or that
+/// `sixng link-archetypes` linked; the build loads the model by that id.
+pub fn resolvable(model_id: Option<&str>, archives: &[String]) -> Result<String, String> {
+    let Some(m) = model_id else { return Err("no model id: the archetype hash names no drawable of an indexed archive and has no archetype link".into()) };
+    let a = m.rsplit_once('@').map_or("", |x| x.0);
+    if !archives.iter().any(|x| x == a) {
+        return Err(format!("model in {a}, which is not indexed"));
+    }
+    Ok(m.to_string())
+}
+
+/// Every interior archetype of interiors.jsonl (`pattern`: substring of
+/// its `int_<hash>` name), one summary each. `game`: also decode portals.
+pub fn interior_list(work: &Path, game: Option<&Path>, pattern: &str) -> Result<Vec<IntSummary>, String> {
+    let lines = instance_lines(work)?;
+    let ip = work.join("index").join("levels.json");
+    let index = sixng_core::scan::load_index(&ip).map_err(|e| format!("{}: {e:#}", ip.display()))?;
+    let archives = indexed_archives(work);
+    let mut by_hash: BTreeMap<u32, IntSummary> = BTreeMap::new();
+    let mut files: HashMap<String, Result<Value, String>> = HashMap::new();
+    let mut metas: HashMap<String, HashMap<u32, MloMeta>> = HashMap::new();
+    for inst in &lines {
+        let Some(h) = hx(&inst["archetype"]) else { continue };
+        if !interior_name(h).contains(pattern) {
+            continue;
+        }
+        let pos = f3(&inst["position"]);
+        if let Some(s) = by_hash.get_mut(&h) {
+            s.placements.push(pos);
+            continue;
+        }
+        let l = &inst["collision_linked"];
+        // a low-confidence link is shown but, as in `fivem build`, not used
+        let low = l["id"].as_str().map(|id| (id.to_string(), format!("{} {} (not used)", l["method"].as_str().unwrap_or("?"), l["confidence"].as_str().unwrap_or("?"))));
+        let mut s = IntSummary { hash: h, placements: vec![pos], rooms: 0, portals: None, entities: 0, set_entities: 0, entities_resolvable: 0, archetypes: 0, resolvable: 0, collision: link_of(inst).or(low), problem: None };
+        match inst["interior_file"].as_str() {
+            None => s.problem = Some("interior archetype file not found by `sixng interiors`".into()),
+            // `sixng placements` writes no JSON for a file without entities
+            Some(_) if inst_entities(inst).next().is_none() => s.problem = Some("no entities".into()),
+            Some(file) => match files.entry(file.to_string()).or_insert_with(|| interior_file(work, file)) {
+                Err(e) => s.problem = Some(e.lines().next().unwrap_or("").to_string()),
+                Ok(src) => {
+                    let ents = src["entities"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                    s.rooms = rooms_of(src, h).len();
+                    s.entities = inst["entities"].as_array().map_or(0, Vec::len);
+                    s.set_entities = inst["entity_set_entities"].as_array().map_or(0, Vec::len);
+                    let mut arch: BTreeMap<u64, bool> = BTreeMap::new();
+                    for e in inst_entities(inst).filter_map(|i| ents.get(i)) {
+                        let ok = resolvable(raw_ent(e).model_id, &archives).is_ok();
+                        s.entities_resolvable += ok as usize;
+                        arch.entry(e["archetype"].as_u64().unwrap_or(0)).or_insert(ok);
+                    }
+                    s.archetypes = arch.len();
+                    s.resolvable = arch.values().filter(|x| **x).count();
+                    if let (Some(g), Some(off)) = (game, file.strip_prefix("levels.rpf@").and_then(|o| u64::from_str_radix(o, 16).ok())) {
+                        let m = metas.entry(file.to_string()).or_insert_with(|| file_mlos(&g.join("levels.rpf"), &index, off));
+                        s.portals = m.get(&h).map(|m| m.portals.as_ref().map_or((0, false), |p| (p.len(), true)));
+                    }
+                }
+            },
+        }
+        by_hash.insert(h, s);
+    }
+    Ok(by_hash.into_values().collect())
+}
+
+/// Interior `want` (`int_<hash>`, hash or name) as plain data. Needs
+/// `sixng collision`, `sixng interiors` and `sixng placements` (for the
+/// interior's file) in `work`; errors name the missing pass.
+pub fn source(game: &Path, work: &Path, want: &str) -> Result<InteriorSource, String> {
+    let h = interior_hash(want).ok_or_else(|| format!("{want}: not an interior name"))?;
+    let name = interior_name(h);
+    let lines = instance_lines(work)?;
+    let insts: Vec<&Value> = lines.iter().filter(|v| hx(&v["archetype"]) == Some(h)).collect();
+    if insts.is_empty() {
+        return Err(format!("{want}: no interior instance with archetype {h:08x} in interiors.jsonl (`redm interior --list` shows them)"));
+    }
+    let inst = insts.iter().copied().find(|v| v["interior_file"].is_string()).ok_or_else(|| format!("{name}: interior archetype file not found by `sixng interiors` (archetype in another archive?)"))?;
+    let file = inst["interior_file"].as_str().unwrap_or_default().to_string();
+    let src = interior_file(work, &file)?;
+    let ip = work.join("index").join("levels.json");
+    let index = sixng_core::scan::load_index(&ip).map_err(|e| format!("{}: {e:#} (run `6ixpack sixng index levels --game .. --work ..` first)", ip.display()))?;
+    let levels = game.join("levels.rpf");
+    let off = file.strip_prefix("levels.rpf@").and_then(|o| u64::from_str_radix(o, 16).ok()).unwrap_or(0);
+    let meta = file_mlos(&levels, &index, off).remove(&h);
+    if meta.is_none() {
+        return Err(format!("{name}: interior archetype not found in the meta of {file} ({})", levels.display()));
+    }
+    let meta = meta.unwrap();
+    let room_list = rooms_of(&src, h);
+    let mut rooms: Vec<IntRoom> = room_list
+        .iter()
+        .enumerate()
+        .map(|(i, (rh, rn))| {
+            let m = meta.rooms.get(i).copied().unwrap_or_default();
+            IntRoom { hash: *rh, name: rn.clone(), bounds: m.bounds, flags: m.flags, entities: Vec::new() }
+        })
+        .collect();
+    let info = src["interiors"].as_array().into_iter().flatten().find(|v| hx(&v["interior"]) == Some(h));
+    let mut sets: Vec<IntSet> =
+        info.and_then(|v| v["entity_sets"].as_array()).into_iter().flatten().filter_map(|s| Some(IntSet { hash: hx(&s["entity_set"])?, name: s["name"].as_str().map(str::to_string), entities: Vec::new() })).collect();
+    let ents = src["entities"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let mut entities = Vec::new();
+    for fi in inst_entities(inst) {
+        let Some(e) = ents.get(fi) else { continue };
+        let r = raw_ent(e);
+        let k = entities.len();
+        let room = r.room.and_then(|rh| rooms.iter().position(|x| x.hash == rh));
+        if let Some(i) = room {
+            rooms[i].entities.push(k);
+        }
+        let entity_set = r.set.map(|sh| match sets.iter().position(|x| x.hash == sh) {
+            Some(i) => i,
+            None => {
+                sets.push(IntSet { hash: sh, name: e["interior"]["entity_set_name"].as_str().map(str::to_string), entities: Vec::new() });
+                sets.len() - 1
+            }
+        });
+        if let Some(i) = entity_set {
+            sets[i].entities.push(k);
+        }
+        entities.push(IntEntity {
+            file_index: fi,
+            archetype: e["archetype"].as_u64().unwrap_or(0) as u32,
+            name: r.name.map(str::to_string),
+            model_id: r.model_id.map(str::to_string),
+            position: r.pos,
+            rotation: r.rot,
+            scale_xy: r.sxy,
+            scale_z: r.sz,
+            lod_dist: r.lod,
+            flags: e["flags"].as_u64().unwrap_or(0) as u32,
+            tint_row: e["tint_row"].as_u64().unwrap_or(0) as u32,
+            room,
+            entity_set,
+        });
+    }
+    let placements = insts
+        .iter()
+        .map(|v| IntPlacement {
+            map: v["map"].as_str().unwrap_or_default().to_string(),
+            instance: v["instance"].as_u64().unwrap_or(0) as usize,
+            position: f3(&v["position"]),
+            rotation: q4(&v["rotation_world"]).unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        })
+        .collect();
+    let (collision, collision_note) = match link_of(inst) {
+        None => (None, Some(format!("no linked collision (sixng link: {})", inst["collision_linked"]["confidence"].as_str().unwrap_or("none")))),
+        Some((id, how)) => match int_collision(&levels, &index, &id) {
+            Ok(mut c) => {
+                let mut w = how.split(' ');
+                c.method = w.next().unwrap_or("").to_string();
+                c.confidence = w.next().unwrap_or("high").to_string();
+                (Some(c), None)
+            }
+            Err(e) => (None, Some(format!("{id}: {e}"))),
+        },
+    };
+    Ok(InteriorSource {
+        hash: h,
+        name,
+        file,
+        bbox: serde_json::from_value(inst["bbox"].clone()).unwrap_or([[-1.0; 3], [1.0; 3]]),
+        placements,
+        rooms,
+        portals_complete: meta.portals.is_some(),
+        portals: meta.portals.unwrap_or_default(),
+        entities,
+        entity_sets: sets,
+        collision,
+        collision_note,
+    })
+}
+
+/// Triangles of a decoded bounds: vertices, triangles, 6m surface id per triangle.
+#[derive(Default, Clone)]
+pub struct Tris {
+    pub vertices: Vec<V3>,
+    pub triangles: Vec<[u32; 3]>,
+    pub materials: Vec<u16>,
+}
+
+fn tris_of(c: &sixng_core::bounds::Collision) -> Tris {
+    let mut t = Tris::default();
+    for (id, (v, idx)) in &c.by_mat {
+        let base = t.vertices.len() as u32;
+        t.vertices.extend_from_slice(v);
+        for x in idx.chunks_exact(3) {
+            t.triangles.push([base + x[0], base + x[1], base + x[2]]);
+            t.materials.push(*id);
+        }
+    }
+    t
+}
+
+/// Decode bounds `id` of the levels index (interior space as stored).
+fn int_collision(levels: &Path, index: &ArchiveIndex, id: &str) -> Result<IntCollision, String> {
+    let e = index.entries.iter().find(|e| e.id == id).ok_or("bounds not in the levels index")?;
+    let r = sixng_core::bounds::load(levels, e).map_err(|e| e.to_string())?;
+    let c = sixng_core::bounds::decode_native(&r, true).ok_or("bounds do not decode")?;
+    let mover = sixng_core::bounds::decode_movement(&r).map(|c| tris_of(&c)).unwrap_or_default();
+    let all = sixng_core::bounds::decode(&r).map(|c| tris_of(&c)).unwrap_or_default();
+    let Tris { vertices, triangles, materials } = tris_of(&c);
+    if triangles.is_empty() && c.native.is_empty() {
+        return Err("bounds hold no triangles or primitives".into());
+    }
+    Ok(IntCollision { id: id.to_string(), method: String::new(), confidence: String::new(), vertices, triangles, materials, primitives: c.native, mover, all, material_records: c.mats, bbox: c.bbox })
 }

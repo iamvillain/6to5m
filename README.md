@@ -6,7 +6,7 @@ Keywords: GTA 6, GTA VI, RPF9, RAGE, BCPack, Xbox Series X, GTA V, FiveM, CodeWa
 
 ## For AI agents: MCP server
 
-Run `6ixpack mcp` as a stdio MCP server, and every CLI command becomes an MCP tool: `extract`, `audio`, `texture`, `model`, `convert`, `sixng`, `fivem`. Each tool takes the same args as the CLI; pass `["--help"]` to discover options.
+Run `6ixpack mcp` as a stdio MCP server, and every CLI command becomes an MCP tool: `extract`, `audio`, `texture`, `model`, `convert`, `sixng`, `fivem`, `redm`. Each tool takes the same args as the CLI; pass `["--help"]` to discover options.
 
 ```json
 { "mcpServers": { "6to5m": { "command": "C:/path/to/6ixpack.exe", "args": ["mcp"] } } }
@@ -23,6 +23,15 @@ cargo build --release                       # -> target/release/6ixpack.exe (pur
 6ixpack fivem vehicle chino --game <GTA VI dir> --out <resource>              # one vehicle -> FiveM vehicle resource
 6ixpack fivem weapon w_pi_scorpio_01 --game <GTA VI dir> --out <resource>       # guns -> FiveM add-on weapon resource (`all` for every gun)
 6ixpack fivem ped cs_lucia --game <GTA VI dir> --out <resource>               # one ped -> FiveM ped resource (--list to preview)
+6ixpack sixng index levels --game <GTA VI dir> --work <work>                  # once: levels.rpf index (~5 min)
+6ixpack redm prop prop_am_bench_26a --game <GTA VI dir> --work <work> --out <resource>  # one prop -> RedM (RDR2) resource
+6ixpack redm prop --list bench --work <work>                                  # find prop names
+6ixpack redm prop prop_am_bench_int_01a --tints --game <GTA VI dir> --work <work>          # list its tint (colour) rows
+6ixpack redm prop prop_am_bench_int_01a --tint-row 5 --as prop_am_bench_int_01a_blue ..    # a colour variant as its own model
+6ixpack redm interior --list --work <work> --game <GTA VI dir>               # 6m interiors (needs the sixng passes below)
+6ixpack redm interior int_d4c876ae --game <GTA VI dir> --work <work> --out <resource> [--at x,y,z,heading]  # interior -> RedM MLO resource
+6ixpack redm convert ytd <dds-dir> out.ytd                                    # DDS -> RDR2 texture dictionary
+6ixpack redm convert ytyp props.json out.ytyp                                 # archetype list -> RDR2 .ytyp (shape: redm --help)
 ```
 
 ## Status
@@ -49,6 +58,8 @@ What works today:
   - Water only over low or empty ground (no ocean ambience under the land); stale outputs pruned on a full build.
   - Texture records versioned per BC codec, so a decoder fix re-decodes only that format.
   - Every output is checked against a CodeWalker loader.
+- **RDR2 / RedM** (`6ixpack redm`, first slice): RSC8 `.ytd` (v2) and static `.ydr` (v162) writers in pure Rust, `redm convert ytd|ydr` from DDS / OBJ, and `redm prop <name>` (one 6m drawable or fragment main drawable, all its LOD levels, `default` shader or `standard` with the real 6m normal map and an `_ma` material map made from the 6m speculartex; `_mb` is the vanilla blank) to a RedM resource. A `.ytyp` archetype (RSC8 meta, static prop: name = ydr stem, bounds from the drawable) is written with the prop and listed as `DLC_ITYP_REQUEST` in `fxmanifest.lua`, so the model is meant to spawn with `CreateObject(joaat(name))`; `redm convert ytyp <json>` builds one without game files. Tinted props: `--tints` lists the rows of the embedded colour palette, `--tint-row <n>` bakes one (exact colours), `--as <model>` writes it under another model name so several colour variants run side by side. Files parse in CodeX and match CodeX-written reference files (ytyp: byte-identical apart from vanilla-style bbMin.w/bbMax.w); not yet loaded in RedM, and no collision yet.
+  - `redm interior` (MLO written, untested in game): `--list` shows every 6m interior (rooms, portals, entities, resolvable entities, linked collision, position); `redm interior <int_hash>` converts every entity archetype that has a model id with the `redm prop` path (`stream/<archetype>.ydr`, textures deduplicated into shared `<int>_txd<N>.ytd` under 14 MiB of pixel data each) and writes `<int>.ytyp` (prop archetypes + the `CMloArchetypeDef`: rooms, portals, the converted entities, entity sets; indices remapped), `<int>_milo_.ymap` (`CMloInstanceDef` at the 6m placement or `--at`), the collision pair `<int>.ybn` + `hi@<int>.ybn` (RSC8 v47, GeometryBVH built the CodeX way; primitives tessellated; 6m surfaces -> RDR2 materials via `sixng surfaces`) `_manifest.ymf` (PSO CPackFileMetaData as the working custom interiors have it: milo ymap -> interior ytyp and the ytyp itself as INTERIOR_DATA, interior bounds `[hi@<int>, <int>]`; schema section embedded from a working manifest) and `fxmanifest.lua` (`this_is_a_map`, no `data_file` lines), plus `interior.json` (debug dump). All RDR2 meta files come from one generic meta writer driven by the class/enum tables of the MLO spec (`src/rdr2/meta_defs.rs`, generated); data blocks match the spec's CodeX goldens byte for byte, ybn vertices/polygons/BVH too. Work data (levels.rpf): `sixng collision levels --out <work>` (26 s), `sixng interiors levels --out <work>` (48 s), `sixng placements levels --id-file <interior files> --out <work>` (1 s), `sixng surfaces levels --navmeshes none --out <work>` (8 s); `sixng link-archetypes levels` (75 s) optional. Only ~6% of interior entities have a model id in the indexed archives (levels.rpf carve covers 5.8% of the archive), so most entities are dropped.
 
 ## Roadmap
 
@@ -116,7 +127,11 @@ Pure Rust, no C code, DLLs or external tools. `cargo build --release` → `targe
 6ixpack fivem vehicle <name> ..          FiveM vehicle resource from one 6m vehicle
 6ixpack fivem weapon <name|all> ..       FiveM weapon resource from 6m guns
 6ixpack fivem ped <name> ..              FiveM ped resource from one 6m ped (cs_lucia, NPCs)
-6ixpack mcp                             stdio MCP server: extract, audio, texture, model, convert, sixng, fivem tools
+6ixpack redm convert ytd|ydr|ytyp ..    RDR2 (RSC8) ytd from DDS, ydr from OBJ, ytyp from JSON
+6ixpack redm prop <name> ..              RedM resource from one 6m prop (--list <pattern>)
+6ixpack redm interior <name> ..          RedM MLO resource from one 6m interior (--list)
+6ixpack redm check <file>                re-read an RDR2 ytd/ydr/ytyp and print its structure
+6ixpack mcp                             stdio MCP server: extract, audio, texture, model, convert, sixng, fivem, redm tools
 ```
 
 Add `--help` to any command. `--threads N` works everywhere.
@@ -138,6 +153,7 @@ Built on the work of:
 - **R0Y00** — [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) (MIT): BCPack BC7 mode-6 golden test vector.
 - **TrinitronClient** — [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) (GPL-3.0, docs): MLO portal, tint palette and format references.
 - **Sollumz** — [Sollumz](https://github.com/Sollumz/Sollumz) (GPL-3.0): GTA V ped bone ids and yft/ytyp/meta format reference.
+- **Sollumz_RDR** — [Sollumz_RDR](https://github.com/Sollumz/Sollumz_RDR) (GPL-3.0): RDR2 shader catalogue facts (per-shader texture/sampler/cbuffer lists, vertex semantics) for the `redm` writers. The RDR2 binary layouts were taken from vanilla RDR2 files and from CodeX (dexyfex) output used only as a parsing oracle; no CodeX code is used.
 - **TomBox** (MIT/Apache-2.0): the vertex-normal stream layout (octahedral 10:10 / 8:8, from the game's mesh shader) in `tools/rage/meshlets.py`, ported in `src/model/decode.rs`.
 
 If you are one of these authors and want your credit, link or code changed or removed, open an issue.

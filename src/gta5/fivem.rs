@@ -327,6 +327,51 @@ impl Ctx {
     }
 }
 
+/// The PACK_ARCHIVES present in `game` and indexed in `work` (others are
+/// reported on stderr: "<id>: not indexed (<path>), <what>").
+pub fn open_packs(game: &Path, work: &Path, what: &str) -> Vec<Pack> {
+    PACK_ARCHIVES
+        .iter()
+        .filter_map(|id| {
+            let path = game.join(id);
+            if !path.is_file() {
+                return None;
+            }
+            let ip = sixng_core::scan::index_path(&work.join("index"), id);
+            let Ok(index) = sixng_core::scan::load_index(&ip) else {
+                eprintln!("{id}: not indexed ({}), {what}", ip.display());
+                return None;
+            };
+            // SAFETY: read-only map; nothing writes the archive while we run.
+            let map = fs::File::open(&path).ok().and_then(|f| unsafe { Mmap::map(&f) }.ok())?;
+            Some(Pack { id: id.to_string(), path, map, index })
+        })
+        .collect()
+}
+
+/// Build state for converting single assets outside `fivem build` (e.g.
+/// `redm prop`): levels.rpf mapped, no pack archives, empty manifest and
+/// report; nothing is emitted through it.
+fn single_ctx(game: &Path, work: &Path) -> Result<Ctx, String> {
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let o = parse(&["--game".into(), s(game), "--out".into(), s(&work.join("single")), "--work".into(), s(work)])?;
+    let lp = game.join("levels.rpf");
+    let lf = fs::File::open(&lp).map_err(|e| format!("{}: {e}", lp.display()))?;
+    let input_time = lf.metadata().and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+    // SAFETY: read-only map; nothing writes the archive while we run.
+    let levels = unsafe { Mmap::map(&lf) }.map_err(|e| e.to_string())?;
+    let stream = o.out.join("stream");
+    let manifest_path = work.join("index").join("single_manifest.json");
+    Ok(Ctx { o, stream, root: None, levels, packs: Vec::new(), input_time, manifest: Default::default(), report: Default::default(), layout: Default::default(), emitted: Default::default(), manifest_path, input_stamp: String::new() })
+}
+
+pub(crate) use buildings::{palette_index, prop_source, prop_tints, PaletteUse, PropBatch, TintPick};
+pub(crate) use buildings::{interior_list, interior_name, interior_resolvable, interior_source, InteriorSource};
+#[cfg(test)]
+pub(crate) use buildings::interior_hash;
+#[cfg(test)]
+pub(crate) use buildings::{check_tint_row, palette_rows};
+
 /// `r6m_<name>` when it fits in 63 chars, else `r6m_<joaat hex>`.
 pub fn safe_name(name: &str) -> String {
     let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' }).collect();
@@ -492,27 +537,7 @@ pub fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(o.work.join("index"))?;
     let input_stamp = format!("{}:{}", lf.metadata()?.len(), input_time.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
     // story / minigame packs: placed only when indexed (`sixng index <id>`)
-    let packs: Vec<Pack> = if o.only.iter().any(|x| x == "buildings") {
-        PACK_ARCHIVES
-            .iter()
-            .filter_map(|id| {
-                let path = o.game.join(id);
-                if !path.is_file() {
-                    return None;
-                }
-                let ip = sixng_core::scan::index_path(&o.work.join("index"), id);
-                let Ok(index) = sixng_core::scan::load_index(&ip) else {
-                    eprintln!("{id}: not indexed ({}), its placements are skipped", ip.display());
-                    return None;
-                };
-                // SAFETY: read-only map; nothing writes the archive while we run.
-                let map = fs::File::open(&path).ok().and_then(|f| unsafe { Mmap::map(&f) }.ok())?;
-                Some(Pack { id: id.to_string(), path, map, index })
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let packs: Vec<Pack> = if o.only.iter().any(|x| x == "buildings") { open_packs(&o.game, &o.work, "its placements are skipped") } else { Vec::new() };
     let ctx = Ctx { o, stream, root, levels, packs, input_time, manifest: Mutex::new(manifest), report: Mutex::new(Report::default()), layout: Mutex::new(layout), emitted: Default::default(), manifest_path, input_stamp };
     let part = |p: &str| ctx.o.only.iter().any(|x| x == p);
 

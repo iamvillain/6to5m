@@ -287,7 +287,7 @@ pub fn build_ytd(texs: &[Tex]) -> Result<Vec<u8>, String> {
 }
 
 /// Texture name from a file stem: strips a leading "NNNN_" numeric prefix.
-fn tex_name(stem: &str) -> String {
+pub fn tex_name(stem: &str) -> String {
     if let Some(i) = stem.find('_') {
         if i > 0 && stem[..i].bytes().all(|c| c.is_ascii_digit()) && i + 1 < stem.len() {
             return stem[i + 1..].to_string();

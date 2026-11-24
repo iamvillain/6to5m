@@ -46,7 +46,7 @@ fn rec_ident(store: &Store, side: &str) -> Option<String> {
     Some(match store.rec(Path::new(&format!("{side}.dds")))?.src {
         Src::Pool { key } => format!("{key:016x} {:016x}", 0),
         Src::Ttpf { h64 } => format!("{:016x} {h64:016x}", 0),
-        Src::Normal { key, h64, .. } => format!("{key:016x} {h64:016x}"),
+        Src::Normal { key, h64, .. } | Src::Ma { key, h64, .. } => format!("{key:016x} {h64:016x}"),
         _ => return None,
     })
 }

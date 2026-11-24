@@ -327,6 +327,26 @@ impl Ctx {
     }
 }
 
+/// Build state for converting single assets outside `fivem build` (e.g.
+/// `redm prop`): levels.rpf mapped, no pack archives, empty manifest and
+/// report; nothing is emitted through it.
+fn single_ctx(game: &Path, work: &Path) -> Result<Ctx, String> {
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let o = parse(&["--game".into(), s(game), "--out".into(), s(&work.join("single")), "--work".into(), s(work)])?;
+    let lp = game.join("levels.rpf");
+    let lf = fs::File::open(&lp).map_err(|e| format!("{}: {e}", lp.display()))?;
+    let input_time = lf.metadata().and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+    // SAFETY: read-only map; nothing writes the archive while we run.
+    let levels = unsafe { Mmap::map(&lf) }.map_err(|e| e.to_string())?;
+    let stream = o.out.join("stream");
+    let manifest_path = work.join("index").join("single_manifest.json");
+    Ok(Ctx { o, stream, root: None, levels, packs: Vec::new(), input_time, manifest: Default::default(), report: Default::default(), layout: Default::default(), emitted: Default::default(), manifest_path, input_stamp: String::new() })
+}
+
+pub(crate) use buildings::{palette_index, prop_source, prop_tints, PaletteUse, TintPick};
+#[cfg(test)]
+pub(crate) use buildings::{check_tint_row, palette_rows};
+
 /// `r6m_<name>` when it fits in 63 chars, else `r6m_<joaat hex>`.
 pub fn safe_name(name: &str) -> String {
     let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' }).collect();

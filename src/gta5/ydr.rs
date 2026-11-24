@@ -26,6 +26,9 @@ pub struct Geom {
     /// Tangent-space normal map (DirectX green); non-empty switches the
     /// geometry to normal_spec.sps with a flat spec map and adds tangents.
     pub normal: String,
+    /// RDR2 only (`rdr2::ydr`): packed material map (`_ma`) of a `standard`
+    /// geometry; empty = the vanilla blank. GTA V writers ignore it.
+    pub spec: String,
     /// Four-layer ground: layer diffuse names (terrain_cb_w_4lyr.sps,
     /// layout PNCCTX); `colours1` holds the blend weights (G picks layers
     /// 2/3 over 0/1, B picks 1/3 over 0/2).

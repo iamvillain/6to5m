@@ -19,6 +19,7 @@ usage: 6ixpack [-n] [-v] <file> [outdir]
        6ixpack model   <args...>   RAGE drawables -> OBJ
        6ixpack convert <kind> ...   GTA V output: ytd, ydr, ybn, ymap, ytyp (--help)
        6ixpack fivem build ...      6m world -> FiveM map resource (terrain, buildings, water)
+       6ixpack redm <args...>       RDR2 / RedM output: ytd, ydr, one 6m prop -> RedM resource (--help)
        6ixpack mcp                 stdio MCP server exposing all of the above as tools
        6ixpack bcpack-calibrate --game <dir> [--out <file>] [--rounds N]
                                    fit the BCPack BC7/BC6H preset tables to the
@@ -50,6 +51,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("mcp") => return mcp::run(),
         Some("convert") => return rpf9::gta5::run(&args[1..]),
         Some("fivem") => return rpf9::gta5::fivem::run(&args[1..]),
+        Some("redm") => return rpf9::rdr2::run(&args[1..]),
         Some("bcpack-calibrate") => return bcpack_calibrate(&args[1..]),
         Some("colour-textures") => return texdump::run(&args[1..]),
         Some("sixng") => {

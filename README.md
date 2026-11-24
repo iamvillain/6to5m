@@ -6,7 +6,7 @@ Keywords: GTA 6, GTA VI, RPF9, RAGE, BCPack, Xbox Series X, GTA V, FiveM, CodeWa
 
 ## For AI agents: MCP server
 
-Run `6ixpack mcp` as a stdio MCP server, and every CLI command becomes an MCP tool: `extract`, `audio`, `texture`, `model`, `convert`, `sixng`, `fivem`. Each tool takes the same args as the CLI; pass `["--help"]` to discover options.
+Run `6ixpack mcp` as a stdio MCP server, and every CLI command becomes an MCP tool: `extract`, `audio`, `texture`, `model`, `convert`, `sixng`, `fivem`, `redm`. Each tool takes the same args as the CLI; pass `["--help"]` to discover options.
 
 ```json
 { "mcpServers": { "6to5m": { "command": "C:/path/to/6ixpack.exe", "args": ["mcp"] } } }
@@ -23,6 +23,13 @@ cargo build --release                       # -> target/release/6ixpack.exe (pur
 6ixpack fivem vehicle chino --game <GTA VI dir> --out <resource>              # one vehicle -> FiveM vehicle resource
 6ixpack fivem weapon w_pi_scorpio_01 --game <GTA VI dir> --out <resource>       # guns -> FiveM add-on weapon resource (`all` for every gun)
 6ixpack fivem ped cs_lucia --game <GTA VI dir> --out <resource>               # one ped -> FiveM ped resource (--list to preview)
+6ixpack sixng index levels --game <GTA VI dir> --work <work>                  # once: levels.rpf index (~5 min)
+6ixpack redm prop prop_am_bench_26a --game <GTA VI dir> --work <work> --out <resource>  # one prop -> RedM (RDR2) resource
+6ixpack redm prop --list bench --work <work>                                  # find prop names
+6ixpack redm prop prop_am_bench_int_01a --tints --game <GTA VI dir> --work <work>          # list its tint (colour) rows
+6ixpack redm prop prop_am_bench_int_01a --tint-row 5 --as prop_am_bench_int_01a_blue ..    # a colour variant as its own model
+6ixpack redm convert ytd <dds-dir> out.ytd                                    # DDS -> RDR2 texture dictionary
+6ixpack redm convert ytyp props.json out.ytyp                                 # archetype list -> RDR2 .ytyp (shape: redm --help)
 ```
 
 ## Status
@@ -49,6 +56,7 @@ What works today:
   - Water only over low or empty ground (no ocean ambience under the land); stale outputs pruned on a full build.
   - Texture records versioned per BC codec, so a decoder fix re-decodes only that format.
   - Every output is checked against a CodeWalker loader.
+- **RDR2 / RedM** (`6ixpack redm`, first slice): RSC8 `.ytd` (v2) and static `.ydr` (v162) writers in pure Rust, `redm convert ytd|ydr` from DDS / OBJ, and `redm prop <name>` (one 6m drawable or fragment main drawable, all its LOD levels, `default` shader or `standard` with the real 6m normal map and an `_ma` material map made from the 6m speculartex; `_mb` is the vanilla blank) to a RedM resource. A `.ytyp` archetype (RSC8 meta, static prop: name = ydr stem, bounds from the drawable) is written with the prop and listed as `DLC_ITYP_REQUEST` in `fxmanifest.lua`, so the model is meant to spawn with `CreateObject(joaat(name))`; `redm convert ytyp <json>` builds one without game files. Tinted props: `--tints` lists the rows of the embedded colour palette, `--tint-row <n>` bakes one (exact colours), `--as <model>` writes it under another model name so several colour variants run side by side. Shaders follow the 6m material kind as in vanilla props: opaque `standard` (bucket 0), cutout `standard` (bucket 3), decal `standard_decal` (bucket 2), alpha `standard_alpha` and glass `standard_glass` (bucket 1), each with the real normal map and `_ma` (a flat normal map and the matte blank `_ma` stand in where the 6m model has none); emissive stays `default`. The cutout, decal and glass shaders are written from vanilla parameter lists and parse in CodeX but are not yet seen in game. Diffuse maps are always sRGB; the 6m LOD switch distances are scaled to RDR2 sizes (`--lod-scale`, default 2, floor 20 m; a tunable assumption). Files parse in CodeX and match CodeX-written reference files (ytyp: byte-identical apart from vanilla-style bbMin.w/bbMax.w). First in-game check (2026-11-24, visual, in RedM): `prop_am_produce_box_m_orange_01a` and a tinted `prop_am_bench_int_01a` spawn and render correctly (textures, tint, normal map, material sheen); the matte-surface and LOD-distance fixes above came from that check and are not re-checked yet. No collision yet.
 
 ## Roadmap
 
@@ -116,7 +124,10 @@ Pure Rust, no C code, DLLs or external tools. `cargo build --release` → `targe
 6ixpack fivem vehicle <name> ..          FiveM vehicle resource from one 6m vehicle
 6ixpack fivem weapon <name|all> ..       FiveM weapon resource from 6m guns
 6ixpack fivem ped <name> ..              FiveM ped resource from one 6m ped (cs_lucia, NPCs)
-6ixpack mcp                             stdio MCP server: extract, audio, texture, model, convert, sixng, fivem tools
+6ixpack redm convert ytd|ydr|ytyp ..    RDR2 (RSC8) ytd from DDS, ydr from OBJ, ytyp from JSON
+6ixpack redm prop <name> ..              RedM resource from one 6m prop (--list <pattern>)
+6ixpack redm check <file>                re-read an RDR2 ytd/ydr/ytyp and print its structure
+6ixpack mcp                             stdio MCP server: extract, audio, texture, model, convert, sixng, fivem, redm tools
 ```
 
 Add `--help` to any command. `--threads N` works everywhere.
@@ -138,6 +149,7 @@ Built on the work of:
 - **R0Y00** — [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) (MIT): BCPack BC7 mode-6 golden test vector.
 - **TrinitronClient** — [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) (GPL-3.0, docs): MLO portal, tint palette and format references.
 - **Sollumz** — [Sollumz](https://github.com/Sollumz/Sollumz) (GPL-3.0): GTA V ped bone ids and yft/ytyp/meta format reference.
+- **Sollumz_RDR** — [Sollumz_RDR](https://github.com/Sollumz/Sollumz_RDR) (GPL-3.0): RDR2 shader catalogue facts (per-shader texture/sampler/cbuffer lists, vertex semantics) for the `redm` writers. The RDR2 binary layouts were taken from vanilla RDR2 files and from CodeX (dexyfex) output used only as a parsing oracle; no CodeX code is used.
 - **TomBox** (MIT/Apache-2.0): the vertex-normal stream layout (octahedral 10:10 / 8:8, from the game's mesh shader) in `tools/rage/meshlets.py`, ported in `src/model/decode.rs`.
 
 If you are one of these authors and want your credit, link or code changed or removed, open an issue.

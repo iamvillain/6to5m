@@ -1,5 +1,14 @@
 # 6to5m: GTA VI to GTA V / FiveM converter (CLI + MCP server)
 
+> **About this fork: RDR2 / RedM integration (work in progress)**
+>
+> This is a fork of [DesignWithTommy/6to5m](https://github.com/DesignWithTommy/6to5m). It exists for one thing: adding **Red Dead Redemption 2 / RedM** as a second output target next to GTA V / FiveM. Everything else follows upstream.
+>
+> - `main`: upstream plus RDR2 **prop** conversion (`6ixpack redm ...`, see Status below). Two converted props have been checked visually in RedM; collision, emissive materials and several shader kinds are not done or not yet seen in game.
+> - `rdr2-mlo`: unfinished **interior (MLO)** research: RDR2 ymap, MLO archetype, collision (ybn) and pack manifest writers and a `redm interior` command. It parses in CodeX but has never been loaded in RedM, and it is based on an older state of the prop code than `main`, so it is not merged yet.
+>
+> No pull request has been opened upstream because this work is not finished. The plan is to offer the prop support upstream once it is verified in game. `TODO.md` (section `redm`) lists what is open.
+
 **6to5m** is a pure-Rust **command-line tool and MCP server** that extracts **GTA VI (Xbox Series X|S version)** RPF9 archives and converts maps, textures, models and collision into **GTA V / FiveM** formats (ydr, ytd, ybn, ymap, ytyp, water.xml) as ready-to-stream FiveM resources. The binary is `6ixpack`.
 
 Keywords: GTA 6, GTA VI, RPF9, RAGE, BCPack, Xbox Series X, GTA V, FiveM, CodeWalker, ydr, ytd, ybn, ymap, MLO, map conversion, modding, MCP, Model Context Protocol, AI agents, Rust.
